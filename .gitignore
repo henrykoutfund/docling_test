@@ -33,4 +33,4 @@ exports/
 output/
 *.csv
 *.json
-*.md
+# Allow repo documentation like README.md to be committed

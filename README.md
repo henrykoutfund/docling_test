@@ -9,6 +9,8 @@ Streamlit app that converts PDFs to structured transaction tables. It uses Docli
 - Raw CSV/JSON downloads (pre‑normalization) and normalized CSV/JSON outputs.
 - UI controls: "Use PDF fallback", "Force fallback only (skip Docling)", and per‑job "Download Markdown".
 - Queue display showing the currently processed file and next items.
+- AG‑UI preview: sidebar demo of event‑based agent run.
+ - Optional AI normalization: LLM‑assisted header mapping for better canonicalization.
 
 ## Requirements
 - Python 3.11+
@@ -26,9 +28,37 @@ Streamlit app that converts PDFs to structured transaction tables. It uses Docli
    pip install -r requirements.txt
    ```
 3. Run the app:
-   ```powershell
-   streamlit run app.py
-   ```
+  ```powershell
+  streamlit run app.py
+  ```
+
+### AI Normalization (LLM‑assisted)
+- Enable with the checkbox "Use AI normalization (LLM‑assisted)" in the UI.
+- Requires environment `OPENAI_API_KEY` and the `openai` Python package installed.
+- Optional: set `OPENAI_MODEL` (default: `gpt-4o-mini`).
+- If not configured, the app falls back automatically to rule‑based normalization.
+
+Example (PowerShell):
+```powershell
+$env:OPENAI_API_KEY = "sk-your-key"
+# optional
+$env:OPENAI_MODEL = "gpt-4o-mini"
+pip install openai
+python -m streamlit run docling_test/app.py
+```
+
+This step asks an LLM to map source headers (e.g., "Fecha", "Concepto", "Saldo") to canonical keys: `date`, `description`, `debit`, `credit`, `amount`, `balance`, `currency`. The app then applies deterministic parsing on values (dates, amounts, negatives, currency detection) to produce a clean dataset.
+
+### AG‑UI Integration (Preview)
+- This app includes a minimal AG‑UI‑style event demo in the sidebar. Press "Run AG‑UI Demo" to see a sequence of standardized events for an agent execution rendered as JSON.
+- AG‑UI is an open, event‑based protocol that standardizes agent ↔ UI interactions and works with SSE/WebSockets transports [0]. See the repo for details and quickstarts.
+
+#### Extending to full AG‑UI
+- Backend: expose an HTTP endpoint that emits AG‑UI events (e.g., SSE) and accepts AG‑UI inputs. You can wire actual agent runs to emit events like `run_start`, `message`, `tool_call`, `progress`, `tool_result`, and `run_end`.
+- Frontend: embed an AG‑UI client in a web UI. In Streamlit, you can use `st.components.v1.html` to load a small JS client (from your own bundle) that subscribes to the SSE endpoint and renders events.
+- Framework integrations are available (LangGraph, CrewAI, PydanticAI, LlamaIndex, Mastra, Agno, etc.) if you prefer to connect an existing agent stack [0].
+
+> Reference: GitHub – AG‑UI Protocol: https://github.com/ag-ui-protocol/ag-ui [0]
 
 ## Push to GitHub
 1. Create a new repository on GitHub (public or private). Copy the repo URL (HTTPS is simplest), e.g. `https://github.com/<your-username>/<repo>.git`.
@@ -65,3 +95,5 @@ Streamlit app that converts PDFs to structured transaction tables. It uses Docli
 - `.gitignore` excludes your virtual environment, caches, and generated outputs. README.md is now tracked.
 - If normalized CSV is empty but raw has rows, use Raw CSV/JSON downloads.
 - For scanned/image‑only PDFs, consider adding OCR fallback (we can wire this in later).
+
+[0] AG‑UI: the Agent‑User Interaction Protocol. Standardized event types, flexible transports, and reference implementations.

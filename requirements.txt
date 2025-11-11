@@ -4,3 +4,4 @@ numpy
 pdfplumber
 pypdfium2
 docling
+openai

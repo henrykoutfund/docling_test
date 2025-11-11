@@ -13,6 +13,8 @@ import pandas as pd
 import streamlit as st
 from docling.document_converter import DocumentConverter
 import pdfplumber
+from ai_normalizer import suggest_mapping
+from agui import demo_events, build_event
 
 
 def save_uploaded_file(uploaded_file) -> Tuple[str, bytes, str]:
@@ -489,10 +491,79 @@ def normalize_transactions(df: pd.DataFrame) -> pd.DataFrame:
     return out_df
 
 
+def normalize_transactions_from_mapping(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """Normalize using an LLM-suggested mapping from original headers to canonical keys."""
+    # Build col_map from mapping (only accept known canonical keys)
+    canonical_keys = {"date", "description", "debit", "credit", "amount", "balance", "currency"}
+    col_map = {k: None for k in canonical_keys}
+    for original, canonical in mapping.items():
+        canon = str(canonical).strip().lower()
+        if canon in canonical_keys and original in df.columns and not col_map[canon]:
+            col_map[canon] = original
+
+    out_rows = []
+    for _, row in df.iterrows():
+        d_text = str(row[col_map["date"]]) if col_map["date"] in df.columns else ""
+        desc = str(row[col_map["description"]]) if col_map["description"] in df.columns else ""
+        debit_text = str(row[col_map["debit"]]) if col_map["debit"] in df.columns else ""
+        credit_text = str(row[col_map["credit"]]) if col_map["credit"] in df.columns else ""
+        amount_text = str(row[col_map["amount"]]) if col_map["amount"] in df.columns else ""
+        balance_text = str(row[col_map["balance"]]) if col_map["balance"] in df.columns else ""
+
+        d = parse_date(d_text)
+        debit_val, cur1 = normalize_amount(debit_text)
+        credit_val, cur2 = normalize_amount(credit_text)
+        amount_val, cur3 = normalize_amount(amount_text)
+        balance_val, cur4 = normalize_amount(balance_text)
+        currency = cur1 or cur2 or cur3 or cur4
+
+        if amount_val is not None and debit_val is None and credit_val is None:
+            if amount_val < 0:
+                debit_val = abs(amount_val)
+            else:
+                credit_val = amount_val
+        elif amount_val is None and (debit_val is not None or credit_val is not None):
+            if debit_val is not None:
+                amount_val = -debit_val
+            elif credit_val is not None:
+                amount_val = credit_val
+
+        out_rows.append({
+            "date": d.isoformat() if d else d_text,
+            "description": desc,
+            "debit": debit_val,
+            "credit": credit_val,
+            "amount": amount_val,
+            "balance": balance_val,
+            "currency": currency,
+        })
+
+    out_df = pd.DataFrame(out_rows)
+    try:
+        out_df["date_parsed"] = pd.to_datetime(out_df["date"], errors="coerce")
+        out_df = out_df.sort_values("date_parsed").drop(columns=["date_parsed"])
+    except Exception:
+        pass
+    return out_df
+
+
 def main():
     st.set_page_config(page_title="Docling Bank Statement Parser", page_icon="📄", layout="wide")
     st.title("Docling Bank Statement Parser")
-    st.caption("Upload statements (PDF/Image), track processing, and download normalized transactions.")
+    st.caption("Upload statements (PDF/Image), then click 'Process uploads' to start.")
+
+    # --- Agent Events: live per-job viewer ---
+    with st.sidebar:
+        st.subheader("Agent Events")
+        if st.session_state.get("jobs"):
+            job_options = [f"{j['name']} ({j['id'][:8]})" for j in st.session_state.jobs]
+            selected_label = st.selectbox("Select job", options=job_options, index=len(job_options) - 1)
+            # map selection back to job
+            selected_idx = job_options.index(selected_label)
+            selected_job = st.session_state.jobs[selected_idx]
+            st.json(selected_job.get("events") or [{"type": "message", "role": "assistant", "content": "No events yet for this job."}], expanded=False)
+        else:
+            st.info("Upload a document to see agent events.")
 
     # Session state for uploaded documents and their conversion status/results
     if "jobs" not in st.session_state:
@@ -520,13 +591,23 @@ def main():
         )
         force_fallback_only = st.checkbox("Force fallback only (skip Docling)", value=False,
                                           help="Skip Docling conversion and use fallback extractors directly for PDFs.")
+        use_ai_normalization = st.checkbox(
+            "Use AI normalization (LLM-assisted)", value=False,
+            help="Requires OPENAI_API_KEY and 'openai' package. Falls back to rule-based if unavailable."
+        )
+    # Processing controls
+    process_triggered = False
     with ctrl_right:
         if st.button("Clear history"):
             st.session_state.jobs = []
             st.experimental_rerun()
+        process_triggered = st.button("Process uploads")
 
-    # Process new uploads
-    if uploaded_files:
+    # Process new uploads only when explicitly triggered
+    if uploaded_files and not process_triggered:
+        st.info("Files staged. Click 'Process uploads' to start processing.")
+
+    if uploaded_files and process_triggered:
         files_list = list(uploaded_files)
         total = len(files_list)
         converter = DocumentConverter()
@@ -549,6 +630,8 @@ def main():
                 "raw_csv_bytes": None,
                 "raw_json_bytes": None,
                 "markdown": None,
+                "events": [],
+                "mapping": None,
             }
             st.session_state.jobs.append(job)
 
@@ -562,8 +645,14 @@ def main():
                 job["status"] = "processing"
                 ext = os.path.splitext(uploaded.name)[1].lower()
 
+                # --- AG-UI: begin run & user intent ---
+                run_id = str(uuid4())
+                job["events"].append(build_event("run_start", {"run_id": run_id, "timestamp": datetime.utcnow().isoformat()}))
+                job["events"].append(build_event("message", {"role": "user", "content": f"Normalize transactions from {uploaded.name}"}))
+
                 # Force fallback-only path for PDFs
                 if force_fallback_only and ext == ".pdf":
+                    job["events"].append(build_event("tool_call", {"tool": "pdfplumber.extract", "args": {"strategy": fallback_strategy}}))
                     fallback_tables: List[pd.DataFrame] = []
                     if fallback_strategy == "auto":
                         tbl_lines = extract_tables_pdfplumber(tmp_path, strategy="lines")
@@ -584,14 +673,19 @@ def main():
                         job["status"] = "done"
                         job["outcome"] = "no_tables"
                         job["rows"] = 0
+                        job["events"].append(build_event("tool_result", {"tool": "pdfplumber.extract", "result": {"tables_found": 0}}))
+                        job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "fail", "error": "no_tables"}))
                         continue
                     else:
                         tables = fallback_tables
                         json_doc = {"note": "skipped_docling"}
+                        job["events"].append(build_event("tool_result", {"tool": "pdfplumber.extract", "result": {"tables_found": len(tables)}}))
                 else:
+                    job["events"].append(build_event("tool_call", {"tool": "docling.convert", "args": {"file": uploaded.name}}))
                     result = converter.convert(tmp_path)
                     json_doc = export_docling_json(result)
                     tables = extract_tables(json_doc)
+                    job["events"].append(build_event("tool_result", {"tool": "docling.convert", "result": {"tables_found": len(tables) if tables else 0}}))
                 if not tables:
                     # Try pdfplumber fallback for PDFs
                     fallback_tables: List[pd.DataFrame] = []
@@ -620,30 +714,60 @@ def main():
                         if md_tables:
                             tables = md_tables
                             job["outcome"] = "success_fallback"
+                            job["events"].append(build_event("progress", {"content": "Used markdown fallback.", "progress": 0.4}))
                         else:
                             # No tables anywhere; provide markdown only
                             job["status"] = "done"
                             job["outcome"] = "no_tables"
                             job["rows"] = 0
                             job["markdown"] = md_text
+                            job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "fail", "error": "no_tables"}))
                             continue
                     else:
                         tables = fallback_tables
+                        job["events"].append(build_event("tool_result", {"tool": "pdfplumber.extract", "result": {"tables_found": len(tables)}}))
 
                 selected_df = choose_transaction_table(tables)
                 txn_df = selected_df if selected_df is not None else tables[0]
+                job["events"].append(build_event("tool_call", {"tool": "choose_table", "args": {"candidates": len(tables)}}))
+                job["events"].append(build_event("tool_result", {"tool": "choose_table", "result": {"rows": int(len(txn_df)), "cols": int(len(txn_df.columns))}}))
                 # Provide raw outputs before normalization
                 try:
                     job["raw_csv_bytes"] = txn_df.to_csv(index=False).encode("utf-8")
                     job["raw_json_bytes"] = txn_df.to_json(orient="records").encode("utf-8")
                 except Exception:
                     pass
-                normalized = normalize_transactions(txn_df)
+                # Choose normalization path (AI-assisted or rule-based)
+                normalized = None
+                if use_ai_normalization:
+                    try:
+                        job["events"].append(build_event("tool_call", {"tool": "ai.suggest_mapping", "args": {"columns": list(map(str, txn_df.columns))}}))
+                        mapping = suggest_mapping(list(txn_df.columns), txn_df.head(15).values.tolist())
+                    except Exception:
+                        mapping = None
+                    if mapping:
+                        normalized = normalize_transactions_from_mapping(txn_df, mapping)
+                        job["mapping"] = mapping
+                        job["events"].append(build_event("tool_result", {"tool": "ai.suggest_mapping", "result": {"mapping": mapping}}))
+                        job["events"].append(build_event("tool_call", {"tool": "normalize.apply_mapping", "args": {"rows": int(len(txn_df))}}))
+                        job["events"].append(build_event("tool_result", {"tool": "normalize.apply_mapping", "result": {"normalized_rows": int(len(normalized))}}))
+                        job["outcome"] = job.get("outcome") or "success_ai"
+                    else:
+                        st.info("AI normalization unavailable: set OPENAI_API_KEY and install 'openai'. Using rule-based normalization.")
+                        normalized = normalize_transactions(txn_df)
+                        job["events"].append(build_event("message", {"role": "assistant", "content": "AI unavailable; used rule-based normalization."}))
+                else:
+                    normalized = normalize_transactions(txn_df)
+                    job["events"].append(build_event("tool_call", {"tool": "normalize.rule_based", "args": {"rows": int(len(txn_df))}}))
+                    job["events"].append(build_event("tool_result", {"tool": "normalize.rule_based", "result": {"normalized_rows": int(len(normalized))}}))
                 job["status"] = "done"
                 job["outcome"] = "success" if json_doc.get("error") != "json_export_failed" and extract_tables(json_doc) else (job.get("outcome") or "success_fallback")
                 job["rows"] = int(len(normalized)) if len(normalized) > 0 else int(len(txn_df))
                 job["csv_bytes"] = normalized.to_csv(index=False).encode("utf-8")
                 job["json_bytes"] = normalized.to_json(orient="records").encode("utf-8")
+
+                job["events"].append(build_event("message", {"role": "assistant", "content": f"Processed {uploaded.name}: {job['rows']} rows."}))
+                job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "success"}))
 
                 # Keep markdown of full document for fallback/reference, if available
                 try:
@@ -680,11 +804,14 @@ def main():
                         job["csv_bytes"] = normalized.to_csv(index=False).encode("utf-8")
                         job["json_bytes"] = normalized.to_json(orient="records").encode("utf-8")
                         st.warning(f"Docling failed for {uploaded.name}: {e}. Used pdfplumber fallback.")
+                        job["events"].append(build_event("message", {"role": "assistant", "content": "Docling failed; used pdfplumber fallback."}))
+                        job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "success"}))
                     except Exception as e2:
                         job["status"] = "done"
                         job["outcome"] = "fail"
                         job["rows"] = 0
                         st.warning(f"Fallback normalization failed for {uploaded.name}: {e2}")
+                        job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "fail", "error": str(e2)}))
                 else:
                     # Try parsing Docling markdown if available (conversion may have produced document but JSON failed)
                     try:
@@ -704,13 +831,16 @@ def main():
                                 job["csv_bytes"] = normalized.to_csv(index=False).encode("utf-8")
                                 job["json_bytes"] = normalized.to_json(orient="records").encode("utf-8")
                                 st.warning(f"Docling failed for {uploaded.name}: {e}. Used markdown fallback.")
-                                return
+                                job["events"].append(build_event("message", {"role": "assistant", "content": "Docling failed; used markdown fallback."}))
+                                job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "success"}))
+                                # Do not return early; continue to render UI below
                     except Exception:
                         pass
                     job["status"] = "done"
                     job["outcome"] = "fail"
                     job["rows"] = 0
                     st.warning(f"Failed to process {uploaded.name}: {e}")
+                    job["events"].append(build_event("run_end", {"timestamp": datetime.utcnow().isoformat(), "status": "fail", "error": str(e)}))
 
     # Upload history table
     st.subheader("Uploaded Documents")
@@ -776,6 +906,61 @@ def main():
                         mime="application/json",
                         key=f"raw_json_{j['id']}",
                     )
+
+            # --- Agent Events per job ---
+            with st.expander(f"Agent Events: {j.get('name')}"):
+                st.json(j.get("events") or [], expanded=False)
+
+            # --- Mapping Editor per job ---
+            with st.expander(f"Edit mapping and re-normalize: {j.get('name')}"):
+                raw_df = None
+                try:
+                    if j.get("raw_json_bytes"):
+                        raw_df = pd.read_json(io.BytesIO(j["raw_json_bytes"]))
+                    elif j.get("raw_csv_bytes"):
+                        raw_df = pd.read_csv(io.BytesIO(j["raw_csv_bytes"]))
+                except Exception:
+                    raw_df = None
+
+                if raw_df is None:
+                    st.info("No raw table available for editing.")
+                else:
+                    st.caption("Map original columns to canonical keys, then re-normalize.")
+                    columns = list(map(str, raw_df.columns))
+                    canonical_keys = ["date", "description", "debit", "credit", "amount", "balance", "currency"]
+                    # Build current selection from saved mapping
+                    saved_map = j.get("mapping") or {}
+                    reverse = {str(v).lower(): k for k, v in saved_map.items()}
+                    with st.form(key=f"map_form_{j['id']}"):
+                        selections = {}
+                        for key in canonical_keys:
+                            default_col = reverse.get(key)
+                            sel = st.selectbox(
+                                f"{key}",
+                                options=["(none)"] + columns,
+                                index=(0 if not default_col or default_col not in columns else (columns.index(default_col) + 1)),
+                                key=f"sel_{j['id']}_{key}"
+                            )
+                            selections[key] = None if sel == "(none)" else sel
+                        submitted = st.form_submit_button("Apply mapping and re-normalize")
+                        if submitted:
+                            # Build mapping original->canonical
+                            new_map = {}
+                            for key, col in selections.items():
+                                if col:
+                                    new_map[col] = key
+                            try:
+                                new_norm = normalize_transactions_from_mapping(raw_df, new_map)
+                                j["csv_bytes"] = new_norm.to_csv(index=False).encode("utf-8")
+                                j["json_bytes"] = new_norm.to_json(orient="records").encode("utf-8")
+                                j["rows"] = int(len(new_norm))
+                                j["mapping"] = new_map
+                                # Append events for manual correction
+                                j["events"].append(build_event("tool_call", {"tool": "normalize.apply_manual_mapping", "args": {"rows": int(len(raw_df))}}))
+                                j["events"].append(build_event("tool_result", {"tool": "normalize.apply_manual_mapping", "result": {"normalized_rows": int(len(new_norm))}}))
+                                st.success("Re-normalized with manual mapping.")
+                            except Exception as e3:
+                                st.error(f"Failed to apply mapping: {e3}")
 
     else:
         st.info("No documents uploaded yet.")

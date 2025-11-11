@@ -92,35 +92,50 @@ def table_cells_to_dataframe(attrs: Dict[str, Any]) -> Optional[pd.DataFrame]:
 def get_converter() -> DocumentConverter:
     """Create a Docling converter configured with RapidOCR ONNX models.
 
-    Downloads models to a writable cache via Hugging Face and passes explicit
-    ONNX model paths to avoid writing under site-packages (read-only on hosts).
+    Prefer packaged ONNX models from rapidocr_onnxruntime to avoid auth/network,
+    and fall back to Hugging Face (public) if not found.
     """
+    # Try using ONNX models bundled in rapidocr_onnxruntime
     try:
-        download_path = snapshot_download(repo_id="RapidAI/RapidOCR")
-        det_model_path = os.path.join(
-            download_path, "onnx", "PP-OCRv5", "det", "ch_PP-OCRv5_server_det.onnx"
-        )
-        rec_model_path = os.path.join(
-            download_path, "onnx", "PP-OCRv5", "rec", "ch_PP-OCRv5_rec_server_infer.onnx"
-        )
-        cls_model_path = os.path.join(
-            download_path, "onnx", "PP-OCRv4", "cls", "ch_ppocr_mobile_v2.0_cls_infer.onnx"
-        )
+        import rapidocr_onnxruntime as rort
+        pkg_dir = os.path.dirname(rort.__file__)
+        models_dir = os.path.join(pkg_dir, "models")
+        det_model_path = os.path.join(models_dir, "ch_PP-OCRv3_det_infer.onnx")
+        rec_model_path = os.path.join(models_dir, "ch_PP-OCRv3_rec_infer.onnx")
+        cls_model_path = os.path.join(models_dir, "ch_ppocr_mobile_v2.0_cls_infer.onnx")
+        if all(os.path.exists(p) for p in [det_model_path, rec_model_path, cls_model_path]):
+            ocr_options = RapidOcrOptions(
+                det_model_path=det_model_path,
+                rec_model_path=rec_model_path,
+                cls_model_path=cls_model_path,
+            )
+            pipeline_options = PdfPipelineOptions(ocr_options=ocr_options)
+            return DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+                }
+            )
+    except Exception:
+        pass
 
+    # Fallback: download public ONNX models from Hugging Face (no auth required)
+    try:
+        download_path = snapshot_download(repo_id="SWHL/RapidOCR")
+        det_model_path = os.path.join(download_path, "PP-OCRv4", "en_PP-OCRv3_det_infer.onnx")
+        rec_model_path = os.path.join(download_path, "PP-OCRv4", "ch_PP-OCRv4_rec_server_infer.onnx")
+        cls_model_path = os.path.join(download_path, "PP-OCRv3", "ch_ppocr_mobile_v2.0_cls_train.onnx")
         ocr_options = RapidOcrOptions(
             det_model_path=det_model_path,
             rec_model_path=rec_model_path,
             cls_model_path=cls_model_path,
         )
         pipeline_options = PdfPipelineOptions(ocr_options=ocr_options)
-
         return DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
             }
         )
     except Exception as e:
-        # Fallback to default converter if model setup fails
         st.warning(f"RapidOCR models setup failed: {e}. Using default converter; OCR may be limited.")
         return DocumentConverter()
 

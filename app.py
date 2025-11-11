@@ -88,6 +88,42 @@ def table_cells_to_dataframe(attrs: Dict[str, Any]) -> Optional[pd.DataFrame]:
     df = pd.DataFrame(grid[1:], columns=headers)
     return df
 
+@st.cache_resource
+def get_converter() -> DocumentConverter:
+    """Create a Docling converter configured with RapidOCR ONNX models.
+
+    Downloads models to a writable cache via Hugging Face and passes explicit
+    ONNX model paths to avoid writing under site-packages (read-only on hosts).
+    """
+    try:
+        download_path = snapshot_download(repo_id="RapidAI/RapidOCR")
+        det_model_path = os.path.join(
+            download_path, "onnx", "PP-OCRv5", "det", "ch_PP-OCRv5_server_det.onnx"
+        )
+        rec_model_path = os.path.join(
+            download_path, "onnx", "PP-OCRv5", "rec", "ch_PP-OCRv5_rec_server_infer.onnx"
+        )
+        cls_model_path = os.path.join(
+            download_path, "onnx", "PP-OCRv4", "cls", "ch_ppocr_mobile_v2.0_cls_infer.onnx"
+        )
+
+        ocr_options = RapidOcrOptions(
+            det_model_path=det_model_path,
+            rec_model_path=rec_model_path,
+            cls_model_path=cls_model_path,
+        )
+        pipeline_options = PdfPipelineOptions(ocr_options=ocr_options)
+
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            }
+        )
+    except Exception as e:
+        # Fallback to default converter if model setup fails
+        st.warning(f"RapidOCR models setup failed: {e}. Using default converter; OCR may be limited.")
+        return DocumentConverter()
+
 
 def extract_tables(json_doc: Dict[str, Any]) -> List[pd.DataFrame]:
     """Extract tables from Docling JSON as DataFrames."""
@@ -974,38 +1010,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-@st.cache_resource
-def get_converter() -> DocumentConverter:
-    """Create a Docling converter configured with RapidOCR ONNX models.
-
-    Downloads models to a writable cache via Hugging Face and passes explicit
-    ONNX model paths to avoid writing under site-packages (read-only on hosts).
-    """
-    try:
-        download_path = snapshot_download(repo_id="RapidAI/RapidOCR")
-        det_model_path = os.path.join(
-            download_path, "onnx", "PP-OCRv5", "det", "ch_PP-OCRv5_server_det.onnx"
-        )
-        rec_model_path = os.path.join(
-            download_path, "onnx", "PP-OCRv5", "rec", "ch_PP-OCRv5_rec_server_infer.onnx"
-        )
-        cls_model_path = os.path.join(
-            download_path, "onnx", "PP-OCRv4", "cls", "ch_ppocr_mobile_v2.0_cls_infer.onnx"
-        )
-
-        ocr_options = RapidOcrOptions(
-            det_model_path=det_model_path,
-            rec_model_path=rec_model_path,
-            cls_model_path=cls_model_path,
-        )
-        pipeline_options = PdfPipelineOptions(ocr_options=ocr_options)
-
-        return DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-            }
-        )
-    except Exception as e:
-        # Fallback to default converter if model setup fails
-        st.warning(f"RapidOCR models setup failed: {e}. Using default converter; OCR may be limited.")
-        return DocumentConverter()

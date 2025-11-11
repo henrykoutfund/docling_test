@@ -3,8 +3,21 @@ import json
 import unicodedata
 from typing import List, Dict, Optional
 
-# NOTE: Using a hardcoded key as requested. Consider rotating if shared.
-API_KEY = "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"
+def _get_api_key() -> Optional[str]:
+    """Retrieve OPENAI_API_KEY from Streamlit secrets or environment.
+
+    Streamlit Cloud: add OPENAI_API_KEY in app settings → Secrets.
+    Local dev: set OPENAI_API_KEY environment variable.
+    """
+    # Try Streamlit secrets first (if running inside Streamlit)
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    # Fallback to environment variable
+    return os.getenv("OPENAI_API_KEY")
 
 
 def suggest_mapping(headers: List[str], sample_rows: List[List[str]]) -> Optional[Dict[str, str]]:
@@ -19,8 +32,8 @@ def suggest_mapping(headers: List[str], sample_rows: List[List[str]]) -> Optiona
     - Optionally set OPENAI_MODEL (default: gpt-4o-mini).
     - Requires 'openai' Python package installed.
     """
-    # Prefer environment variable, but fall back to hardcoded key if not set
-    api_key = os.getenv("OPENAI_API_KEY") or API_KEY
+    # Retrieve API key securely
+    api_key = _get_api_key()
     if not api_key:
         return None
 

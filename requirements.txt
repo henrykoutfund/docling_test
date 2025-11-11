@@ -5,3 +5,4 @@ pdfplumber
 pypdfium2
 docling
 openai
+opencv-python-headless

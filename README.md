@@ -84,6 +84,20 @@ This step asks an LLM to map source headers (e.g., "Fecha", "Concepto", "Saldo")
 3. Ensure `requirements.txt` contains all needed packages.
 4. Deploy; changes pushed to `main` will auto‑redeploy.
 
+### Cloud (Linux) runtime: libGL fix
+If you see an error like `libGL.so.1: cannot open shared object file`, your runtime is missing OpenGL libraries required by imaging dependencies (often via OpenCV).
+
+- On Streamlit Community Cloud, include a `packages.txt` file (already added) with:
+  - `libgl1`
+  - `libglib2.0-0`
+- We also include `opencv-python-headless` in `requirements.txt` to avoid GUI‑linked OpenCV binaries.
+
+For other Linux hosts:
+- Debian/Ubuntu: `sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0`
+- CentOS/RHEL: `sudo yum install -y mesa-libGL glib2`
+
+After installing, redeploy/restart the app.
+
 ## Updating dependencies
 - To capture your current environment:
   ```powershell

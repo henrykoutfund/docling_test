@@ -371,7 +371,12 @@ def extract_tables_from_markdown(md: str) -> List[pd.DataFrame]:
 
 def parse_date(value: str) -> Optional[datetime]:
     value = (value or "").strip()
-    for fmt in ["%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m-%d-%Y", "%d %b %Y", "%d %B %Y"]:
+    # common formats incl. two-digit year (e.g., 01 Aug 25)
+    formats = [
+        "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m-%d-%Y",
+        "%d %b %Y", "%d %B %Y", "%d %b %y", "%d %B %y",
+    ]
+    for fmt in formats:
         try:
             return datetime.strptime(value, fmt)
         except Exception:
@@ -380,8 +385,8 @@ def parse_date(value: str) -> Optional[datetime]:
 
 
 def normalize_amount(text: str) -> Tuple[Optional[float], Optional[str]]:
-    """Parse numeric amount and return (amount, currency). Handles EU formats and trailing symbols.
-    Parentheses and leading '-' treated as negative.
+    """Parse numeric amount and return (amount, currency).
+    Handles UK and EU formats and common currency annotations.
     """
     t = (text or "").strip()
     if not t:
@@ -413,12 +418,22 @@ def normalize_amount(text: str) -> Tuple[Optional[float], Optional[str]]:
         negative = True
         t = t[1:]
 
-    # Normalize European formats: e.g., 1.566,52 -> 1566.52
-    if "," in t and "." in t:
+    # Decide thousands/decimal separators:
+    # - UK style: 163,403.10 -> remove commas only
+    # - EU style: 1.566,52 -> remove dots as thousands, convert comma to dot
+    uk_match = re.fullmatch(r"[-]?\d{1,3}(,\d{3})+(\.\d+)?", t)
+    eu_match = re.fullmatch(r"[-]?\d{1,3}(\.\d{3})+(,\d+)?", t)
+    if uk_match:
+        t = t.replace(",", "")
+    elif eu_match:
         t = t.replace(".", "")
         t = t.replace(",", ".")
-    elif "," in t and "." not in t:
-        t = t.replace(",", ".")
+    else:
+        # If only comma present and looks like decimal
+        if "," in t and "." not in t:
+            t = t.replace(",", ".")
+        else:
+            t = t.replace(",", "")  # safe to drop stray thousands commas
 
     # Strip any stray non-digit/non-dot characters
     t = re.sub(r"[^0-9\.]", "", t)
@@ -440,8 +455,9 @@ HEADER_CANDIDATES = {
         "description", "details", "narration", "payee", "particulars",
         "concepto", "descripcion", "descripción", "mas datos", "más datos",
     ],
-    "debit": ["debit", "withdrawal", "dr", "out", "cargo", "retiro"],
-    "credit": ["credit", "deposit", "cr", "in", "abono", "ingreso"],
+    # Avoid overly broad tokens like 'in'/'out'; prefer explicit phrases
+    "debit": ["debit", "withdrawal", "dr", "money out", "payments", "outgoing", "cargo", "retiro"],
+    "credit": ["credit", "deposit", "cr", "money in", "receipts", "incoming", "abono", "ingreso"],
     "amount": ["amount", "value", "amt", "importe", "valor"],
     "balance": ["balance", "closing balance", "avail balance", "saldo"],
 }
@@ -458,11 +474,13 @@ def match_header(col_name: str) -> Optional[str]:
     raw = (col_name or "").strip().lower()
     name = strip_accents(raw)
     for key, variants in HEADER_CANDIDATES.items():
-        if name == key or key in name:
+        # direct match or clear containment of the canonical key
+        if name == key or (key in name and len(key) > 2):
             return key
         for v in variants:
             vn = strip_accents(v.lower())
-            if name.startswith(vn) or vn in name:
+            # use word-boundary matching to avoid accidental matches (e.g., 'in' in 'description')
+            if re.search(rf"\b{re.escape(vn)}\b", name):
                 return key
     return None
 
@@ -479,6 +497,12 @@ def choose_transaction_table(tables: List[pd.DataFrame]) -> Optional[pd.DataFram
                 score += 2
         # Prefer moderate column widths typical of statements
         if 3 <= len(cols) <= 8:
+            score += 1
+        # Bonus if both money-in and money-out style headers detected, or balance present
+        names = " ".join(map(lambda x: str(x).lower(), cols))
+        if re.search(r"\bmoney\s+in\b", names) and re.search(r"\bmoney\s+out\b", names):
+            score += 2
+        if any(match_header(str(c)) == "balance" for c in cols):
             score += 1
         if score > best_score:
             best_score = score

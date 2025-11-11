@@ -6,3 +6,5 @@ pypdfium2
 docling
 openai
 opencv-python-headless
+rapidocr_onnxruntime
+huggingface_hub

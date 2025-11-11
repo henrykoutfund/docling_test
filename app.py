@@ -12,6 +12,10 @@ import unicodedata
 import pandas as pd
 import streamlit as st
 from docling.document_converter import DocumentConverter
+from docling.document_converter import PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
+from huggingface_hub import snapshot_download
 import pdfplumber
 from ai_normalizer import suggest_mapping
 from agui import demo_events, build_event
@@ -682,6 +686,8 @@ def main():
                         job["events"].append(build_event("tool_result", {"tool": "pdfplumber.extract", "result": {"tables_found": len(tables)}}))
                 else:
                     job["events"].append(build_event("tool_call", {"tool": "docling.convert", "args": {"file": uploaded.name}}))
+                    # Initialize Docling converter with RapidOCR ONNX models (cached)
+                    converter = get_converter()
                     result = converter.convert(tmp_path)
                     json_doc = export_docling_json(result)
                     tables = extract_tables(json_doc)
@@ -968,3 +974,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+@st.cache_resource
+def get_converter() -> DocumentConverter:
+    """Create a Docling converter configured with RapidOCR ONNX models.
+
+    Downloads models to a writable cache via Hugging Face and passes explicit
+    ONNX model paths to avoid writing under site-packages (read-only on hosts).
+    """
+    try:
+        download_path = snapshot_download(repo_id="RapidAI/RapidOCR")
+        det_model_path = os.path.join(
+            download_path, "onnx", "PP-OCRv5", "det", "ch_PP-OCRv5_server_det.onnx"
+        )
+        rec_model_path = os.path.join(
+            download_path, "onnx", "PP-OCRv5", "rec", "ch_PP-OCRv5_rec_server_infer.onnx"
+        )
+        cls_model_path = os.path.join(
+            download_path, "onnx", "PP-OCRv4", "cls", "ch_ppocr_mobile_v2.0_cls_infer.onnx"
+        )
+
+        ocr_options = RapidOcrOptions(
+            det_model_path=det_model_path,
+            rec_model_path=rec_model_path,
+            cls_model_path=cls_model_path,
+        )
+        pipeline_options = PdfPipelineOptions(ocr_options=ocr_options)
+
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            }
+        )
+    except Exception as e:
+        # Fallback to default converter if model setup fails
+        st.warning(f"RapidOCR models setup failed: {e}. Using default converter; OCR may be limited.")
+        return DocumentConverter()
